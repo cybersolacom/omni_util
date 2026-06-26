@@ -63,23 +63,21 @@ class PostgresUtil:
         self.uri = os.getenv("POSTGRES_URI")
         self.conn = None
 
-    def close(self):
-        """接続を閉じる"""
-        if self.conn:
-            self.conn.close()
-
     def __enter__(self):
         self.conn = psycopg2.connect(self.uri)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.conn:
-            if exc_type is None:
-                self.conn.commit()
-            elif exc_type is not None:
-                self.conn.rollback()
-            self.conn.close()
-            logger.debug("Connection closed automatically.")
+            try:
+                if exc_type is None:
+                    self.conn.commit()
+                else:
+                    self.conn.rollback()
+            finally:
+                self.conn.close()
+                self.conn = None
+                logger.debug("Connection closed and cleared.")
 
     # ------------------------------------------------------------------
     # ユーティリティー
