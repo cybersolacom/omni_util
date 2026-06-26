@@ -2,6 +2,7 @@ import inspect
 import json
 import os
 import psycopg2
+from psycopg2 import sql
 from psycopg2.extras import RealDictCursor, execute_values
 from dotenv import load_dotenv
 import logging
@@ -93,112 +94,149 @@ class PostgresUtil:
         return tuple(cleaned_values)
 
     def _create_where_str(self, where_doc):
+        """psycopg2.sql を使用して安全な WHERE 句を構築"""
+        # 無条件は許容しない ※カスタムクエリで実装すること
+        if not where_doc:
+            raise ValueError(
+                "条件が設定されていません。無条件はカスタムクエリを使用してください。"
+            )
+
         where_conditions = []
         for col, val in where_doc.items():
             if isinstance(val, list):
-                where_conditions.append(f"{col} && %s")
+                condition = sql.SQL("{} && %s").format(sql.Identifier(col))
             else:
-                where_conditions.append(f"{col} = %s")
-        return " AND ".join(where_conditions)
+                condition = sql.SQL("{} = %s").format(sql.Identifier(col))
+            where_conditions.append(condition)
+
+        return sql.SQL(" AND ").join(where_conditions)
 
     def _create_insert_sql(self, table_name, insert_doc):
         if not insert_doc:
-            raise ValueError("条件が設定されていません")
-        insert_columns = list(insert_doc.keys())
-        insert_column_str = ", ".join(insert_columns)
-        placeholder_str = ", ".join(["%s"] * len(insert_columns))
-        return (
-            f"INSERT INTO {table_name} ({insert_column_str}) VALUES ({placeholder_str})"
+            raise ValueError("項目が設定されていません")
+
+        columns = insert_doc.keys()
+        query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() * len(columns)),
         )
+        return query
 
     def _create_select_sql(self, table_name, where_doc, select_columns=None):
-        if not where_doc:
-            raise ValueError("条件が設定されていません")
         where_str = self._create_where_str(where_doc)
-        select_str = "*" if not select_columns else ", ".join(select_columns)
-        return f"SELECT {select_str} FROM {table_name} WHERE {where_str}"
+
+        if not select_columns:
+            select_str = sql.SQL("*")
+        else:
+            select_str = sql.SQL(", ").join(map(sql.Identifier, select_columns))
+
+        return sql.SQL("SELECT {} FROM {} WHERE {}").format(
+            select_str, sql.Identifier(table_name), where_str
+        )
 
     def _create_update_sql(self, table_name, where_doc, update_doc):
-        if not where_doc or not update_doc:
-            raise ValueError("条件が設定されていません")
         where_str = self._create_where_str(where_doc)
-        update_str = " , ".join(f"{col} = %s" for col in update_doc.keys())
-        return f"UPDATE {table_name} SET {update_str} WHERE {where_str}"
+        update_str = sql.SQL(", ").join(
+            sql.SQL("{} = %s").format(sql.Identifier(col)) for col in update_doc.keys()
+        )
+
+        return sql.SQL("UPDATE {} SET {} WHERE {}").format(
+            sql.Identifier(table_name), update_str, where_str
+        )
 
     def _create_update_jsonb_merge_sql(self, table_name, where_doc, update_doc):
-        where_str = " AND ".join(f"{col} = %s" for col in where_doc.keys())
-        update_str = " , ".join(
-            f"{col} = COALESCE({col}, '{{}}'::jsonb) || %s::jsonb"
+        where_str = self._create_where_str(where_doc)
+
+        # COALESCE(col, '{}'::jsonb) || %s::jsonb を安全に構築
+        update_str = sql.SQL(", ").join(
+            sql.SQL("{} = COALESCE({}, '{{}}'::jsonb) || %s::jsonb").format(
+                sql.Identifier(col), sql.Identifier(col)
+            )
             for col in update_doc.keys()
         )
-        return f"UPDATE {table_name} SET {update_str} WHERE {where_str}"
+
+        return sql.SQL("UPDATE {} SET {} WHERE {}").format(
+            sql.Identifier(table_name), update_str, where_str
+        )
 
     def _create_delete_sql(self, table_name, where_doc):
-        if not where_doc:
-            raise ValueError("条件が設定されていません")
-        return f"DELETE FROM {table_name} WHERE {self._create_where_str(where_doc)}"
+        return sql.SQL("DELETE FROM {} WHERE {}").format(
+            sql.Identifier(table_name), self._create_where_str(where_doc)
+        )
 
     def _create_count_sql(self, table_name, where_doc):
-        return f"SELECT COUNT(*) as count FROM {table_name} WHERE {self._create_where_str(where_doc)}"
+        return sql.SQL("SELECT COUNT(*) as count FROM {} WHERE {}").format(
+            sql.Identifier(table_name), self._create_where_str(where_doc)
+        )
 
-    def _query(self, is_one, sql, params=None):
+    def _query(self, is_one, sql_query, params=None):
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
+            cur.execute(sql_query, params)
             return cur.fetchone() if is_one else cur.fetchall()
 
     def _select(self, is_one, table_name, where_doc, select_columns=None):
-        sql = self._create_select_sql(table_name, where_doc, select_columns)
+        sql_query = self._create_select_sql(table_name, where_doc, select_columns)
         values = self._preprocess_params(where_doc)
-        return self._query(is_one, sql, values)
+        return self._query(is_one, sql_query, values)
 
     # ------------------------------------------------------------------
     # パブリック
     # ------------------------------------------------------------------
     @auto_connect
-    def query_one(self, sql, params=None):
-        return self._query(True, sql, params)
+    def query_one(self, sql_query, params=None):
+        return self._query(True, sql_query, params)
 
     @auto_connect
-    def query_list(self, sql, params=None):
-        return self._query(False, sql, params)
+    def query_list(self, sql_query, params=None):
+        return self._query(False, sql_query, params)
 
     @auto_connect
-    def execute_cud(self, sql, params=None, mode="Execute"):
+    def execute_cud(self, sql_query, params=None, mode="Execute"):
         """CUD実行。スタティック呼び出し時は自動コミット、インスタンス時は__exit__またはdb.commit()で制御"""
         with self.conn.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(sql_query, params)
             count = cur.rowcount
-            if count > 0:
-                logger.debug(f"[{mode}] Success: {count} row(s) affected.")
-                return True
-            else:
-                logger.warning(f"[{mode}] Warning: No rows affected.")
-                return False
+            logger.debug(f"[{mode}] {count} row(s) affected.")
+            return count
 
     @auto_connect
-    def execute_use_values(self, sql, params):
+    def execute_use_values(self, sql_query, params):
         """CUD実行(values)。スタティック呼び出し時は自動コミット、インスタンス時は__exit__またはdb.commit()で制御"""
         with self.conn.cursor() as cur:
-            execute_values(cur, sql, params)
-            logger.debug(f"[execute_values] Success into {params}")
+            # psycopg2.sql.Composedオブジェクトをexecute_valuesが受け取れるように文字列化
+            if hasattr(sql_query, "as_string"):
+                sql_query = sql_query.as_string(self.conn)
+
+            execute_values(cur, sql_query, params)
+            logger.debug("[execute_values] %d row(s) sent", len(params))
             return True
 
     @auto_connect
     def insert(self, table_name, insert_doc):
         """1件挿入"""
-        sql = self._create_insert_sql(table_name, insert_doc)
+        sql_query = self._create_insert_sql(table_name, insert_doc)
         values = self._preprocess_params(insert_doc)
-        return self.execute_cud(sql, values, f"Insert into {table_name}")
+        return self.execute_cud(sql_query, values, f"Insert into {table_name}")
 
     @auto_connect
     def insert_many(self, table_name, insert_docs):
-        """複数挿入（高速版）"""
         if not insert_docs:
+            logger.warning("インサート件数が0件です")
             return True
         columns = list(insert_docs[0].keys())
-        sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES %s"
-        params_list = [self._preprocess_params(doc) for doc in insert_docs]
-        return self.execute_use_values(sql, params_list)
+        sql_query = sql.SQL("INSERT INTO {} ({}) VALUES %s").format(
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+        )
+        params_list = []
+        for doc in insert_docs:
+            missing = [c for c in columns if c not in doc]
+            if missing:
+                raise ValueError(f"行に不足している列があります: {missing}")
+            # 列順にそろえてから既存の前処理に通す
+            params_list.append(self._preprocess_params({c: doc[c] for c in columns}))
+        return self.execute_use_values(sql_query, params_list)
 
     @auto_connect
     def select_one(self, table_name, where_doc, select_columns=None):
@@ -211,42 +249,44 @@ class PostgresUtil:
     @auto_connect
     def count(self, table_name, where_doc):
         """指定した条件に一致するレコード数を取得"""
-        sql = self._create_count_sql(table_name, where_doc)
+        sql_query = self._create_count_sql(table_name, where_doc)
         values = self._preprocess_params(where_doc)
-        result = self.query_one(sql, values)
+        result = self.query_one(sql_query, values)
         return result["count"] if result else 0
 
     @auto_connect
     def update(self, table_name, where_doc, update_doc):
         """更新 + 更新行数チェック"""
-        sql = self._create_update_sql(table_name, where_doc, update_doc)
+        sql_query = self._create_update_sql(table_name, where_doc, update_doc)
         params = tuple(self._preprocess_params(update_doc)) + tuple(
             self._preprocess_params(where_doc)
         )
-        return self.execute_cud(sql, params, "Update")
+        return self.execute_cud(sql_query, params, "Update")
 
     @auto_connect
     def update_jsonb_merge(self, table_name, where_doc, update_doc):
         """更新 + 更新行数チェック（JSONBマージ）"""
-        sql = self._create_update_jsonb_merge_sql(table_name, where_doc, update_doc)
+        sql_query = self._create_update_jsonb_merge_sql(
+            table_name, where_doc, update_doc
+        )
         params = tuple(self._preprocess_params(update_doc)) + tuple(
             self._preprocess_params(where_doc)
         )
-        return self.execute_cud(sql, params, "Update")
+        return self.execute_cud(sql_query, params, "Update")
 
     @auto_connect
     def delete(self, table_name, where_doc):
         """削除 + 更新行数チェック"""
-        sql = self._create_delete_sql(table_name, where_doc)
+        sql_query = self._create_delete_sql(table_name, where_doc)
         values = self._preprocess_params(where_doc)
-        return self.execute_cud(sql, values, f"Delete {table_name}")
+        return self.execute_cud(sql_query, values, f"Delete {table_name}")
 
     @auto_connect
-    def select_iter(self, sql, params=None):
+    def select_iter(self, sql_query, params=None):
         """1件ずつ yield するジェネレータ (MongoDBのCursor的な挙動)"""
         cur = self.conn.cursor(cursor_factory=RealDictCursor)
         try:
-            cur.execute(sql, params)
+            cur.execute(sql_query, params)
             for row in cur:
                 yield row
         finally:
