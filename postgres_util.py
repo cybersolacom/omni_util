@@ -1,12 +1,13 @@
+import functools
 import inspect
 import json
+import logging
 import os
+
 import psycopg2
+from dotenv import load_dotenv
 from psycopg2 import sql
 from psycopg2.extras import RealDictCursor, execute_values
-from dotenv import load_dotenv
-import logging
-import functools
 
 load_dotenv()
 logging.basicConfig(
@@ -111,15 +112,16 @@ class PostgresUtil:
 
         return sql.SQL(" AND ").join(where_conditions)
 
-    def _create_insert_sql(self, table_name, insert_doc):
+    def _create_insert_sql(self, table_name, insert_doc, returning_column="id"):
         if not insert_doc:
             raise ValueError("項目が設定されていません")
 
         columns = insert_doc.keys()
-        query = sql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+        query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING {}").format(
             sql.Identifier(table_name),
             sql.SQL(", ").join(map(sql.Identifier, columns)),
             sql.SQL(", ").join(sql.Placeholder() * len(columns)),
+            sql.Identifier(returning_column),
         )
         return query
 
@@ -213,11 +215,18 @@ class PostgresUtil:
             return True
 
     @auto_connect
-    def insert(self, table_name, insert_doc):
+    def insert(self, table_name, insert_doc, returning_column="id"):
         """1件挿入"""
-        sql_query = self._create_insert_sql(table_name, insert_doc)
+        sql_query = self._create_insert_sql(table_name, insert_doc, returning_column)
         values = self._preprocess_params(insert_doc)
-        return self.execute_cud(sql_query, values, f"Insert into {table_name}")
+
+        # idを戻り値として返却
+        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql_query, values)
+            row = cur.fetchone()
+            if row and returning_column in row:
+                return row[returning_column]
+            return None
 
     @auto_connect
     def insert_many(self, table_name, insert_docs):
