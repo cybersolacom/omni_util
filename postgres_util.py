@@ -30,13 +30,18 @@ class _AutoConnect:
         functools.update_wrapper(self, func)
 
     def __get__(self, obj, objtype=None):
-        if obj is None or obj.conn is None:
-            # クラス呼び出し → 一時接続＆自動コミット
+        # obj があればインスタンス（例: db_merged.select_one(...)）
+        # obj がなければクラス直接（例: PostgresUtil.select_one(...)）
+        current_db = obj if obj is not None else objtype()
+
+        if obj is None or current_db.conn is None:
+            # クラス呼び出し（または未接続のインスタンス） → 一時接続＆自動コミット
             if inspect.isgeneratorfunction(self.func):
 
                 @functools.wraps(self.func)
                 def one_shot_gen(*args, **kwargs):
-                    with objtype() as db:
+                    # ★ここを変更：単に objtype() とするのではなく、current_db.schema を引き継ぐ！
+                    with objtype(schema=current_db.schema) as db:
                         yield from self.func(db, *args, **kwargs)
 
                 return one_shot_gen
@@ -44,7 +49,8 @@ class _AutoConnect:
 
                 @functools.wraps(self.func)
                 def one_shot(*args, **kwargs):
-                    with objtype() as db:
+                    # ★ここを変更：単に objtype() とするのではなく、current_db.schema を引き継ぐ！
+                    with objtype(schema=current_db.schema) as db:
                         return self.func(db, *args, **kwargs)
 
                 return one_shot
@@ -61,12 +67,20 @@ class PostgresUtil:
     # ------------------------------------------------------------------
     # 手続き
     # ------------------------------------------------------------------
-    def __init__(self):
+    def __init__(self, schema=None):  # ← schemaを受け取れるようにする
         self.uri = os.getenv("POSTGRES_URI")
         self.conn = None
+        self.schema = schema  # スキーマ名を保持
 
     def __enter__(self):
         self.conn = psycopg2.connect(self.uri)
+        if self.schema:
+            with self.conn.cursor() as cur:
+                # SQLインジェクションを防ぐため sql.Identifier を使用
+                cur.execute(
+                    sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema))
+                )
+            self.conn.commit()  # 設定を反映
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
