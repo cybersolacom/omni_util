@@ -76,9 +76,11 @@ class PostgresUtil:
         self.conn = psycopg2.connect(self.uri)
         if self.schema:
             with self.conn.cursor() as cur:
-                # SQLインジェクションを防ぐため sql.Identifier を使用
+                # 指定スキーマを優先しつつ、public (vector拡張など) も参照可能にする
                 cur.execute(
-                    sql.SQL("SET search_path TO {}").format(sql.Identifier(self.schema))
+                    sql.SQL("SET search_path TO {}, public").format(
+                        sql.Identifier(self.schema)
+                    )
                 )
             self.conn.commit()  # 設定を反映
         return self
