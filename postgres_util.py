@@ -18,6 +18,144 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+class SqlBuilder:
+    """
+    SQL文・パラメーターの組み立て専用クラス。
+    状態（self）も DB接続も持たない純粋関数の集まりなので、全て staticmethod。
+    インスタンス化はせず、SqlBuilder.format(...) のようにクラスから直接呼ぶこと。
+    DB なしで単体テストできる。
+    """
+
+    @staticmethod
+    def format(sql_template, params=None):
+        """
+        値以外（テーブル名やカラム名などの識別子）専用のプレースホルダー置換関数。
+        - sql_template: "{table} から {col} を取得" のようなテンプレート文字列、
+                        または psycopg2.sql.Composed オブジェクト。
+        - params: 埋め込む識別子の辞書（キーワード引数用）またはリスト/タプル（位置引数用）。
+
+        ※注意: WHERE句の「値（データ）」には絶対に使用せず、%s プレースホルダーを使い、
+                execute(query, values) の第2引数に渡してください。
+        """
+        if params is None:
+            params = {}
+
+        # 文字列テンプレートの場合は sql.SQL に変換
+        if isinstance(sql_template, str):
+            query_obj = sql.SQL(sql_template)
+        else:
+            query_obj = sql_template
+
+        # リストやタプルの場合は位置引数として展開
+        if isinstance(params, (list, tuple)):
+            identifiers = [
+                sql.Identifier(p) if isinstance(p, str) else p for p in params
+            ]
+            return query_obj.format(*identifiers)
+
+        # 辞書の場合はキーワード引数として展開
+        elif isinstance(params, dict):
+            identifiers = {
+                k: (sql.Identifier(v) if isinstance(v, str) else v)
+                for k, v in params.items()
+            }
+            return query_obj.format(**identifiers)
+
+        raise TypeError("params は dict, list, または tuple である必要があります。")
+
+    @staticmethod
+    def preprocess_params(param_doc):
+        """辞書の中身をPostgreSQLの型に合わせて一括変換する共通処理"""
+        return tuple(
+            json.dumps(v, default=str) if isinstance(v, dict) else v
+            for v in param_doc.values()
+        )
+
+    @staticmethod
+    def create_where_str(where_doc):
+        """psycopg2.sql を使用して安全な WHERE 句を構築"""
+        # 無条件は許容しない ※カスタムクエリで実装すること
+        if not where_doc:
+            raise ValueError(
+                "条件が設定されていません。無条件はカスタムクエリを使用してください。"
+            )
+
+        where_conditions = []
+        for col, val in where_doc.items():
+            if isinstance(val, list):
+                condition = sql.SQL("{} && %s").format(sql.Identifier(col))
+            else:
+                condition = sql.SQL("{} = %s").format(sql.Identifier(col))
+            where_conditions.append(condition)
+
+        return sql.SQL(" AND ").join(where_conditions)
+
+    @staticmethod
+    def create_insert_sql(table_name, insert_doc, returning_column="id"):
+        if not insert_doc:
+            raise ValueError("項目が設定されていません")
+
+        columns = insert_doc.keys()
+        return sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING {}").format(
+            sql.Identifier(table_name),
+            sql.SQL(", ").join(map(sql.Identifier, columns)),
+            sql.SQL(", ").join(sql.Placeholder() * len(columns)),
+            sql.Identifier(returning_column),
+        )
+
+    @staticmethod
+    def create_select_sql(table_name, where_doc, select_columns=None):
+        where_str = SqlBuilder.create_where_str(where_doc)
+
+        if not select_columns:
+            select_str = sql.SQL("*")
+        else:
+            select_str = sql.SQL(", ").join(map(sql.Identifier, select_columns))
+
+        return sql.SQL("SELECT {} FROM {} WHERE {}").format(
+            select_str, sql.Identifier(table_name), where_str
+        )
+
+    @staticmethod
+    def create_update_sql(table_name, where_doc, update_doc):
+        where_str = SqlBuilder.create_where_str(where_doc)
+        update_str = sql.SQL(", ").join(
+            sql.SQL("{} = %s").format(sql.Identifier(col)) for col in update_doc.keys()
+        )
+
+        return sql.SQL("UPDATE {} SET {} WHERE {}").format(
+            sql.Identifier(table_name), update_str, where_str
+        )
+
+    @staticmethod
+    def create_update_jsonb_merge_sql(table_name, where_doc, update_doc):
+        where_str = SqlBuilder.create_where_str(where_doc)
+
+        # COALESCE(col, '{}'::jsonb) || %s::jsonb を安全に構築
+        update_str = sql.SQL(", ").join(
+            sql.SQL("{} = COALESCE({}, '{{}}'::jsonb) || %s::jsonb").format(
+                sql.Identifier(col), sql.Identifier(col)
+            )
+            for col in update_doc.keys()
+        )
+
+        return sql.SQL("UPDATE {} SET {} WHERE {}").format(
+            sql.Identifier(table_name), update_str, where_str
+        )
+
+    @staticmethod
+    def create_delete_sql(table_name, where_doc):
+        return sql.SQL("DELETE FROM {} WHERE {}").format(
+            sql.Identifier(table_name), SqlBuilder.create_where_str(where_doc)
+        )
+
+    @staticmethod
+    def create_count_sql(table_name, where_doc):
+        return sql.SQL("SELECT COUNT(*) as count FROM {} WHERE {}").format(
+            sql.Identifier(table_name), SqlBuilder.create_where_str(where_doc)
+        )
+
+
 class _AutoConnect:
     """
     クラスから呼ばれたかインスタンスから呼ばれたかで動作を切り替えるディスクリプタ。
@@ -100,102 +238,14 @@ class PostgresUtil:
     # ------------------------------------------------------------------
     # ユーティリティー
     # ------------------------------------------------------------------
-    def _preprocess_params(self, param_doc):
-        """辞書の中身をPostgreSQLの型に合わせて一括変換する共通処理"""
-        cleaned_values = []
-        for k, v in param_doc.items():
-            if isinstance(v, dict):
-                cleaned_values.append(json.dumps(v, default=str))
-            else:
-                cleaned_values.append(v)
-        return tuple(cleaned_values)
-
-    def _create_where_str(self, where_doc):
-        """psycopg2.sql を使用して安全な WHERE 句を構築"""
-        # 無条件は許容しない ※カスタムクエリで実装すること
-        if not where_doc:
-            raise ValueError(
-                "条件が設定されていません。無条件はカスタムクエリを使用してください。"
-            )
-
-        where_conditions = []
-        for col, val in where_doc.items():
-            if isinstance(val, list):
-                condition = sql.SQL("{} && %s").format(sql.Identifier(col))
-            else:
-                condition = sql.SQL("{} = %s").format(sql.Identifier(col))
-            where_conditions.append(condition)
-
-        return sql.SQL(" AND ").join(where_conditions)
-
-    def _create_insert_sql(self, table_name, insert_doc, returning_column="id"):
-        if not insert_doc:
-            raise ValueError("項目が設定されていません")
-
-        columns = insert_doc.keys()
-        query = sql.SQL("INSERT INTO {} ({}) VALUES ({}) RETURNING {}").format(
-            sql.Identifier(table_name),
-            sql.SQL(", ").join(map(sql.Identifier, columns)),
-            sql.SQL(", ").join(sql.Placeholder() * len(columns)),
-            sql.Identifier(returning_column),
-        )
-        return query
-
-    def _create_select_sql(self, table_name, where_doc, select_columns=None):
-        where_str = self._create_where_str(where_doc)
-
-        if not select_columns:
-            select_str = sql.SQL("*")
-        else:
-            select_str = sql.SQL(", ").join(map(sql.Identifier, select_columns))
-
-        return sql.SQL("SELECT {} FROM {} WHERE {}").format(
-            select_str, sql.Identifier(table_name), where_str
-        )
-
-    def _create_update_sql(self, table_name, where_doc, update_doc):
-        where_str = self._create_where_str(where_doc)
-        update_str = sql.SQL(", ").join(
-            sql.SQL("{} = %s").format(sql.Identifier(col)) for col in update_doc.keys()
-        )
-
-        return sql.SQL("UPDATE {} SET {} WHERE {}").format(
-            sql.Identifier(table_name), update_str, where_str
-        )
-
-    def _create_update_jsonb_merge_sql(self, table_name, where_doc, update_doc):
-        where_str = self._create_where_str(where_doc)
-
-        # COALESCE(col, '{}'::jsonb) || %s::jsonb を安全に構築
-        update_str = sql.SQL(", ").join(
-            sql.SQL("{} = COALESCE({}, '{{}}'::jsonb) || %s::jsonb").format(
-                sql.Identifier(col), sql.Identifier(col)
-            )
-            for col in update_doc.keys()
-        )
-
-        return sql.SQL("UPDATE {} SET {} WHERE {}").format(
-            sql.Identifier(table_name), update_str, where_str
-        )
-
-    def _create_delete_sql(self, table_name, where_doc):
-        return sql.SQL("DELETE FROM {} WHERE {}").format(
-            sql.Identifier(table_name), self._create_where_str(where_doc)
-        )
-
-    def _create_count_sql(self, table_name, where_doc):
-        return sql.SQL("SELECT COUNT(*) as count FROM {} WHERE {}").format(
-            sql.Identifier(table_name), self._create_where_str(where_doc)
-        )
-
     def _query(self, is_one, sql_query, params=None):
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql_query, params)
             return cur.fetchone() if is_one else cur.fetchall()
 
     def _select(self, is_one, table_name, where_doc, select_columns=None):
-        sql_query = self._create_select_sql(table_name, where_doc, select_columns)
-        values = self._preprocess_params(where_doc)
+        sql_query = SqlBuilder.create_select_sql(table_name, where_doc, select_columns)
+        values = SqlBuilder.preprocess_params(where_doc)
         return self._query(is_one, sql_query, values)
 
     # ------------------------------------------------------------------
@@ -233,8 +283,10 @@ class PostgresUtil:
     @auto_connect
     def insert(self, table_name, insert_doc, returning_column="id"):
         """1件挿入"""
-        sql_query = self._create_insert_sql(table_name, insert_doc, returning_column)
-        values = self._preprocess_params(insert_doc)
+        sql_query = SqlBuilder.create_insert_sql(
+            table_name, insert_doc, returning_column
+        )
+        values = SqlBuilder.preprocess_params(insert_doc)
 
         # idを戻り値として返却
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -260,7 +312,9 @@ class PostgresUtil:
             if missing:
                 raise ValueError(f"行に不足している列があります: {missing}")
             # 列順にそろえてから既存の前処理に通す
-            params_list.append(self._preprocess_params({c: doc[c] for c in columns}))
+            params_list.append(
+                SqlBuilder.preprocess_params({c: doc[c] for c in columns})
+            )
         return self.execute_use_values(sql_query, params_list)
 
     @auto_connect
@@ -274,36 +328,36 @@ class PostgresUtil:
     @auto_connect
     def count(self, table_name, where_doc):
         """指定した条件に一致するレコード数を取得"""
-        sql_query = self._create_count_sql(table_name, where_doc)
-        values = self._preprocess_params(where_doc)
+        sql_query = SqlBuilder.create_count_sql(table_name, where_doc)
+        values = SqlBuilder.preprocess_params(where_doc)
         result = self.query_one(sql_query, values)
         return result["count"] if result else 0
 
     @auto_connect
     def update(self, table_name, where_doc, update_doc):
         """更新 + 更新行数チェック"""
-        sql_query = self._create_update_sql(table_name, where_doc, update_doc)
-        params = tuple(self._preprocess_params(update_doc)) + tuple(
-            self._preprocess_params(where_doc)
+        sql_query = SqlBuilder.create_update_sql(table_name, where_doc, update_doc)
+        params = tuple(SqlBuilder.preprocess_params(update_doc)) + tuple(
+            SqlBuilder.preprocess_params(where_doc)
         )
         return self.execute_cud(sql_query, params, "Update")
 
     @auto_connect
     def update_jsonb_merge(self, table_name, where_doc, update_doc):
         """更新 + 更新行数チェック（JSONBマージ）"""
-        sql_query = self._create_update_jsonb_merge_sql(
+        sql_query = SqlBuilder.create_update_jsonb_merge_sql(
             table_name, where_doc, update_doc
         )
-        params = tuple(self._preprocess_params(update_doc)) + tuple(
-            self._preprocess_params(where_doc)
+        params = tuple(SqlBuilder.preprocess_params(update_doc)) + tuple(
+            SqlBuilder.preprocess_params(where_doc)
         )
         return self.execute_cud(sql_query, params, "Update")
 
     @auto_connect
     def delete(self, table_name, where_doc):
         """削除 + 更新行数チェック"""
-        sql_query = self._create_delete_sql(table_name, where_doc)
-        values = self._preprocess_params(where_doc)
+        sql_query = SqlBuilder.create_delete_sql(table_name, where_doc)
+        values = SqlBuilder.preprocess_params(where_doc)
         return self.execute_cud(sql_query, values, f"Delete {table_name}")
 
     @auto_connect
@@ -312,10 +366,36 @@ class PostgresUtil:
         cur = self.conn.cursor(cursor_factory=RealDictCursor)
         try:
             cur.execute(sql_query, params)
-            for row in cur:
-                yield row
+            yield from cur
         finally:
             cur.close()
+
+    @auto_connect
+    def get_columns(self, table_name, exclude=None):
+        """テーブルの列名リスト(list[str])を定義順で返す。excludeの列は除く"""
+        rows = self._query(
+            False,
+            """
+            SELECT column_name::text AS column_name
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+              AND NOT (column_name::text = ANY(%s::text[]))
+            ORDER BY ordinal_position
+            """,
+            (table_name, list(exclude or [])),
+        )
+        return [r["column_name"] for r in rows]
+
+    @auto_connect
+    def get_columns_sql(self, table_name, exclude=None, alias=None):
+        """get_columns の結果を sql.Composed で返す。aliasありなら "alias"."col" 形式"""
+        cols = self.get_columns(table_name, exclude)
+        if not cols:
+            raise ValueError(f"{table_name} に対象列がありません")
+        return sql.SQL(", ").join(
+            sql.Identifier(alias, c) if alias else sql.Identifier(c) for c in cols
+        )
 
     # ------------------------------------------------------------------
     # パブリック ※インスタンスメソッドのみ
