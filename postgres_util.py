@@ -27,41 +27,13 @@ class SqlBuilder:
     """
 
     @staticmethod
-    def format(sql_template, params=None):
-        """
-        値以外（テーブル名やカラム名などの識別子）専用のプレースホルダー置換関数。
-        - sql_template: "{table} から {col} を取得" のようなテンプレート文字列、
-                        または psycopg2.sql.Composed オブジェクト。
-        - params: 埋め込む識別子の辞書（キーワード引数用）またはリスト/タプル（位置引数用）。
-
-        ※注意: WHERE句の「値（データ）」には絶対に使用せず、%s プレースホルダーを使い、
-                execute(query, values) の第2引数に渡してください。
-        """
-        if params is None:
-            params = {}
-
-        # 文字列テンプレートの場合は sql.SQL に変換
-        if isinstance(sql_template, str):
-            query_obj = sql.SQL(sql_template)
-        else:
-            query_obj = sql_template
-
-        # リストやタプルの場合は位置引数として展開
-        if isinstance(params, (list, tuple)):
-            identifiers = [
-                sql.Identifier(p) if isinstance(p, str) else p for p in params
-            ]
-            return query_obj.format(*identifiers)
-
-        # 辞書の場合はキーワード引数として展開
-        elif isinstance(params, dict):
-            identifiers = {
-                k: (sql.Identifier(v) if isinstance(v, str) else v)
-                for k, v in params.items()
-            }
-            return query_obj.format(**identifiers)
-
-        raise TypeError("params は dict, list, または tuple である必要があります。")
+    def create_columns_sql(columns, alias=None):
+        """カラム名のリストから、sql.SQLのカンマ区切り（必要に応じてエイリアス付き）を構築する"""
+        if not columns:
+            raise ValueError("対象の列がありません")
+        return sql.SQL(", ").join(
+            sql.Identifier(alias, c) if alias else sql.Identifier(c) for c in columns
+        )
 
     @staticmethod
     def preprocess_params(param_doc):
@@ -389,13 +361,9 @@ class PostgresUtil:
 
     @auto_connect
     def get_columns_sql(self, table_name, exclude=None, alias=None):
-        """get_columns の結果を sql.Composed で返す。aliasありなら "alias"."col" 形式"""
+        """テーブルのカラムを取得して sql.SQL を返す"""
         cols = self.get_columns(table_name, exclude)
-        if not cols:
-            raise ValueError(f"{table_name} に対象列がありません")
-        return sql.SQL(", ").join(
-            sql.Identifier(alias, c) if alias else sql.Identifier(c) for c in cols
-        )
+        return SqlBuilder.create_columns_sql(cols, alias=alias)
 
     # ------------------------------------------------------------------
     # パブリック ※インスタンスメソッドのみ
